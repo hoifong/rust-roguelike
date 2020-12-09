@@ -2,8 +2,8 @@ use rand::Rng;
 use std::cmp;
 use tcod::colors::*;
 use tcod::console::*;
-use tcod::input::Key;
 use tcod::input::KeyCode::*;
+use tcod::input::{self, Event, Key, Mouse};
 use tcod::map::{FovAlgorithm, Map as FovMap};
 
 const LIMIT_FPS: i32 = 20;
@@ -40,6 +40,7 @@ const COLOR_LIGHT_GROUND: Color = Color {
 const ROOM_MAX_SIZE: i32 = 10;
 const ROOM_MIN_SIZE: i32 = 6;
 const MAX_ROOMS: i32 = 30;
+const MAX_ROOM_ITEMS: i32 = 2;
 
 const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic;
 const FOV_LIGHT_WALLS: bool = true;
@@ -54,6 +55,8 @@ struct Tcod {
     con: Offscreen,
     panel: Offscreen,
     fov: FovMap,
+    key: Key,
+    mouse: Mouse,
 }
 
 struct Messages {
@@ -85,6 +88,7 @@ struct Object {
     alive: bool,
     fighter: Option<Fighter>,
     ai: Option<Ai>,
+    item: Option<Item>,
 }
 
 impl Object {
@@ -99,6 +103,7 @@ impl Object {
             alive: false,
             fighter: None,
             ai: None,
+            item: None,
         }
     }
 
@@ -191,6 +196,7 @@ type Map = Vec<Vec<Tile>>;
 struct Game {
     map: Map,
     messages: Messages,
+    inventory: Vec<Object>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +248,11 @@ struct Fighter {
 #[derive(Debug)]
 enum Ai {
     Basic,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum Item {
+    Heal,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -344,6 +355,23 @@ fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &mut Game, objects: &mut V
     }
 }
 
+fn pick_item_up(object_id: usize, game: &mut Game, objects: &mut Vec<Object>) {
+    if game.inventory.len() >= 26 {
+        game.messages.add(
+            format!(
+                "Your inventory is full, cannot pick up {}.",
+                objects[object_id].name
+            ),
+            RED,
+        );
+    } else {
+        let item = objects.swap_remove(object_id);
+        game.messages
+            .add(format!("You picked up a {}!", item.name), GREEN);
+        game.inventory.push(item);
+    }
+}
+
 fn is_blocked(x: i32, y: i32, map: &Map, objects: &Vec<Object>) -> bool {
     //  first test the map tile
     if map[x as usize][y as usize].blocked {
@@ -396,6 +424,19 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
         };
         monster.alive = true;
         objects.push(monster);
+    }
+
+    let num_items = rand::thread_rng().gen_range(0, MAX_ROOM_ITEMS + 1);
+
+    for _ in 0..num_items {
+        let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
+        let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
+
+        if !is_blocked(x, y, map, objects) {
+            let mut object = Object::new(x, y, '!', "healing potion", VIOLET, false);
+            object.item = Some(Item::Heal);
+            objects.push(object);
+        }
     }
 }
 
@@ -533,6 +574,15 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, objects: &Vec<Object>, fov_recom
         tcod.panel.print_rect(MSG_X, y, MSG_WIDTH, 0, msg);
     }
 
+    tcod.panel.set_default_foreground(LIGHT_GREY);
+    tcod.panel.print_ex(
+        1,
+        0,
+        BackgroundFlag::None,
+        TextAlignment::Left,
+        get_name_under_mouse(tcod.mouse, objects, &tcod.fov),
+    );
+
     blit(
         &tcod.panel,
         (0, 0),
@@ -544,11 +594,22 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, objects: &Vec<Object>, fov_recom
     );
 }
 
+fn get_name_under_mouse(mouse: Mouse, objects: &Vec<Object>, fov_map: &FovMap) -> String {
+    let (x, y) = (mouse.cx as i32, mouse.cy as i32);
+
+    let names = objects
+        .iter()
+        .filter(|object| object.pos() == (x, y) && fov_map.is_in_fov(object.x, object.y))
+        .map(|object| object.name.clone())
+        .collect::<Vec<_>>();
+
+    names.join(", ")
+}
+
 fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> PlayerAction {
     use PlayerAction::*;
-    let key = tcod.root.wait_for_keypress(true);
     let player_alive = objects[PLAYER].alive;
-    match (key, key.text(), player_alive) {
+    match (tcod.key, tcod.key.text(), player_alive) {
         (
             Key {
                 code: Enter,
@@ -580,10 +641,21 @@ fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> P
             player_move_or_attack(1, 0, game, objects);
             TookTurn
         }
+        (Key { code: Text, .. }, "g", true) => {
+            let item_id = objects
+                .iter()
+                .position(|object| object.pos() == objects[PLAYER].pos() && object.item.is_some());
+            if let Some(item_id) = item_id {
+                pick_item_up(item_id, game, objects);
+            }
+            DidntTakeTurn
+        }
 
         _ => DidntTakeTurn,
     }
 }
+
+fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root) -> Option<usize> {}
 
 fn render_bar(
     panel: &mut Offscreen,
@@ -638,12 +710,15 @@ fn main() {
     let mut game = Game {
         map: make_map(&mut objects),
         messages: Messages::new(),
+        inventory: vec![],
     };
     let mut tcod = Tcod {
         root,
         con,
         panel: Offscreen::new(SCREEN_WIDTH, PANEL_HEIGHT),
         fov: FovMap::new(MAP_WIDTH, MAP_HEIGHT),
+        key: Default::default(),
+        mouse: Default::default(),
     };
 
     tcod::system::set_fps(LIMIT_FPS);
@@ -663,6 +738,12 @@ fn main() {
     );
 
     while !tcod.root.window_closed() {
+        match input::check_for_event(input::MOUSE | input::KEY_PRESS) {
+            Some((_, Event::Mouse(m))) => tcod.mouse = m,
+            Some((_, Event::Key(k))) => tcod.key = k,
+            _ => tcod.key = Default::default(),
+        }
+
         tcod.con.clear();
 
         for object in &objects {
