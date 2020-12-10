@@ -20,6 +20,8 @@ const MSG_X: i32 = BAR_WIDTH + 2;
 const MSG_WIDTH: i32 = SCREEN_WIDTH - BAR_WIDTH - 2;
 const MSG_HEIGHT: usize = PANEL_HEIGHT as usize - 1;
 
+const INVENTORY_WIDTH: i32 = 50;
+
 const COLOR_DARK_WALL: Color = Color { r: 0, g: 0, b: 100 };
 const COLOR_DARK_GROUND: Color = Color {
     r: 50,
@@ -49,6 +51,7 @@ const TORCH_RADIUS: i32 = 10;
 const MAX_ROOM_MONSTERS: i32 = 3;
 
 const PLAYER: usize = 0;
+const HEAL_AMOUNT: i32 = 4;
 
 struct Tcod {
     root: Root,
@@ -164,6 +167,15 @@ impl Object {
             );
         }
     }
+
+    pub fn heal(&mut self, amount: i32) {
+        if let Some(ref mut fighter) = self.fighter {
+            fighter.hp += amount;
+            if fighter.hp > fighter.max_hp {
+                fighter.hp = fighter.max_hp;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -253,6 +265,11 @@ enum Ai {
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum Item {
     Heal,
+}
+
+enum UseResult {
+    UsedUp,
+    Canceled,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -369,6 +386,46 @@ fn pick_item_up(object_id: usize, game: &mut Game, objects: &mut Vec<Object>) {
         game.messages
             .add(format!("You picked up a {}!", item.name), GREEN);
         game.inventory.push(item);
+    }
+}
+
+fn cast_heal(
+    inventory_id: usize,
+    tcod: &mut Tcod,
+    game: &mut Game,
+    objects: &mut Vec<Object>,
+) -> UseResult {
+    if let Some(fighter) = objects[PLAYER].fighter {
+        if fighter.hp == fighter.max_hp {
+            game.messages.add("You are already at full health.", RED);
+            return UseResult::Canceled;
+        }
+        game.messages
+            .add("Your wounds start to feel better!", LIGHT_VIOLET);
+        objects[PLAYER].heal(HEAL_AMOUNT);
+        return UseResult::UsedUp;
+    }
+    return UseResult::Canceled;
+}
+
+fn use_item(inventory_id: usize, tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) {
+    if let Some(item) = game.inventory[inventory_id].item {
+        let on_use = match item {
+            Item::Heal => cast_heal,
+        };
+        match on_use(inventory_id, tcod, game, objects) {
+            UseResult::UsedUp => {
+                game.inventory.remove(inventory_id);
+            }
+            UseResult::Canceled => {
+                game.messages.add("Canceled", WHITE);
+            }
+        }
+    } else {
+        game.messages.add(
+            format!("The {} cannot be used.", game.inventory[inventory_id].name),
+            WHITE,
+        );
     }
 }
 
@@ -609,7 +666,7 @@ fn get_name_under_mouse(mouse: Mouse, objects: &Vec<Object>, fov_map: &FovMap) -
 fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> PlayerAction {
     use PlayerAction::*;
     let player_alive = objects[PLAYER].alive;
-    match (tcod.key, tcod.key.text(), player_alive) {
+    match (tcod.key, tcod.key.printable, player_alive) {
         (
             Key {
                 code: Enter,
@@ -641,7 +698,7 @@ fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> P
             player_move_or_attack(1, 0, game, objects);
             TookTurn
         }
-        (Key { code: Text, .. }, "g", true) => {
+        (Key { code: Char, .. }, 'g', true) => {
             let item_id = objects
                 .iter()
                 .position(|object| object.pos() == objects[PLAYER].pos() && object.item.is_some());
@@ -650,12 +707,90 @@ fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> P
             }
             DidntTakeTurn
         }
+        (Key { code: Char, .. }, 'i', true) => {
+            if let Some(inventory_index) = inventory_menu(
+                &game.inventory,
+                "Press the key next to an item to use it, or any other to cancel.\n",
+                &mut tcod.root,
+            ) {
+                use_item(inventory_index, tcod, game, objects);
+            }
+            DidntTakeTurn
+        }
 
         _ => DidntTakeTurn,
     }
 }
 
-fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root) -> Option<usize> {}
+fn inventory_menu(inventory: &[Object], header: &str, root: &mut Root) -> Option<usize> {
+    let options = if inventory.len() == 0 {
+        vec!["Inventory is empty.".into()]
+    } else {
+        inventory.iter().map(|item| item.name.clone()).collect()
+    };
+
+    let inventory_index = menu(header, &options, INVENTORY_WIDTH, root);
+
+    if inventory.len() > 0 {
+        inventory_index
+    } else {
+        None
+    }
+}
+
+fn menu<T: AsRef<str>>(header: &str, options: &[T], width: i32, root: &mut Root) -> Option<usize> {
+    assert!(
+        options.len() <= 26,
+        "Cannot have a menu with more than 26 options."
+    );
+
+    let header_height = root.get_height_rect(0, 0, width, SCREEN_HEIGHT, header);
+    let height = options.len() as i32 + header_height;
+
+    let mut window = Offscreen::new(width, height);
+
+    window.set_default_foreground(WHITE);
+    window.print_rect_ex(
+        0,
+        0,
+        width,
+        height,
+        BackgroundFlag::None,
+        TextAlignment::Left,
+        header,
+    );
+
+    for (index, option_text) in options.iter().enumerate() {
+        let menu_letter = (b'a' + index as u8) as char;
+        let text = format!("({}) {}", menu_letter, option_text.as_ref());
+
+        window.print_ex(
+            0,
+            header_height + index as i32,
+            BackgroundFlag::None,
+            TextAlignment::Left,
+            text,
+        );
+    }
+
+    let x = SCREEN_WIDTH / 2 - width / 2;
+    let y = SCREEN_HEIGHT / 2 - width / 2;
+    blit(&window, (0, 0), (width, height), root, (x, y), 1.0, 0.7);
+
+    root.flush();
+    let key = root.wait_for_keypress(true);
+
+    if key.printable.is_alphabetic() {
+        let index = key.printable.to_ascii_lowercase() as usize - 'a' as usize;
+        if index < options.len() {
+            Some(index)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
 
 fn render_bar(
     panel: &mut Offscreen,
